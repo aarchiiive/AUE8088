@@ -28,13 +28,17 @@ from tqdm import tqdm
 
 from utils.augmentations import (
     Albumentations,
+    AlbumentationsPair,
     augment_hsv,
     classify_albumentations,
     classify_transforms,
     copy_paste,
+    copy_paste_pair,
     letterbox,
     mixup,
+    mixup_pair,
     random_perspective,
+    random_perspective_pair
 )
 from utils.general import (
     DATASETS_DIR,
@@ -174,6 +178,8 @@ def create_dataloader(
     shuffle=False,
     seed=0,
     rgbt_input=False,
+    use_depth=False,
+    modalities=('lwir', 'visible'),
 ):
     if rect and shuffle:
         LOGGER.warning("WARNING ⚠️ --rect is incompatible with DataLoader shuffle, setting shuffle=False")
@@ -195,6 +201,8 @@ def create_dataloader(
             image_weights=image_weights,
             prefix=prefix,
             rank=rank,
+            use_depth=use_depth,
+            modalities=modalities,
         )
 
     batch_size = min(batch_size, len(dataset))
@@ -548,18 +556,21 @@ class LoadImagesAndLabels(Dataset):
         image_weights=False,
         cache_images=False,
         single_cls=False,
+        use_depth=False,
         stride=32,
         pad=0.0,
         min_items=0,
         prefix="",
         rank=-1,
         seed=0,
+        modalities=('lwir', 'visible'),
     ):
         self.img_size = img_size
         self.augment = augment
         self.hyp = hyp
         self.image_weights = image_weights
         self.rect = False if image_weights else rect
+        self.use_depth = use_depth  # use depth images
         self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
@@ -590,12 +601,14 @@ class LoadImagesAndLabels(Dataset):
         # Check cache
         self.label_files = self.img2label_paths(self.im_files)  # labels
         cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix(".cache")
-        try:
-            cache, exists = np.load(cache_path, allow_pickle=True).item(), True  # load dict
-            assert cache["version"] == self.cache_version  # matches current version
-            assert cache["hash"] == get_hash(self.label_files + self.im_files)  # identical hash
-        except Exception:
-            cache, exists = self.cache_labels(cache_path, prefix), False  # run cache ops
+        # try:
+        #     cache, exists = np.load(cache_path, allow_pickle=True).item(), True  # load dict
+        #     assert cache["version"] == self.cache_version  # matches current version
+        #     assert cache["hash"] == get_hash(self.label_files + self.im_files)  # identical hash
+        # except Exception:
+        #     cache, exists = self.cache_labels(cache_path, prefix), False  # run cache ops
+
+        cache, exists = self.cache_labels(cache_path, prefix), False  # run cache ops
 
         # Display cache
         nf, nm, ne, nc, n = cache.pop("results")  # found, missing, empty, corrupt, total
@@ -1067,6 +1080,7 @@ class LoadImagesAndLabels(Dataset):
 class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
     cache_version = 0.2  # dataset labels *.cache version
     modalities = ('lwir', 'visible')
+    # modalities = ('lwir', 'enhanced') # You can change this to use different modalities (e.g. 'lwir', 'visible', 'enhanced')
     ignore_settings = {
         'train': {  # standard training setting for KAIST dataset
             'hRng':( 12/512,  np.inf),
@@ -1086,6 +1100,7 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
         # HACK: cannot guarantee that path contain split name
         is_train = 'train' in path
         single_cls = kwargs['single_cls']
+        self.modalities = kwargs['modalities'] if 'modalities' in kwargs else self.modalities
         kwargs['single_cls'] = False
         assert kwargs['cache_images'] != 'ram', 'Image caching for RGBT dataset is not implemented yet.'
         if not is_train:
@@ -1095,7 +1110,8 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
         super().__init__(path, **kwargs)
 
         # TODO: make mosaic augmentation work
-        self.mosaic = False
+        self.mosaic = self.augment
+        self.albumentations = AlbumentationsPair(size=self.img_size) if self.augment else None
 
         # Set ignore flag
         cond = self.ignore_settings['train' if is_train else 'test']
@@ -1199,83 +1215,73 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
 
         hyp = self.hyp
         mosaic = self.mosaic and random.random() < hyp["mosaic"]
-        if mosaic:
-            raise NotImplementedError('Please make "mosaic" augmentation work!')
-
-            # TODO: Load mosaic
-            img, labels = self.load_mosaic(index)
+        if mosaic and self.augment:
+            # Load mosaic (returns (rgb, lwir), labels)
+            (m_lwir, m_rgb), labels = self.load_mosaic(index)
             shapes = None
 
-            # TODO: MixUp augmentation
+            # MixUp augmentation on the paired mosaics
             if random.random() < hyp["mixup"]:
-                img, labels = mixup(img, labels, *self.load_mosaic(random.choice(self.indices)))
+                idx2 = random.choice(self.indices)
+                (m2_lwir, m2_rgb), labels2 = self.load_mosaic(idx2)
+                (m_lwir, m_rgb), labels = mixup_pair(
+                    (m_lwir, m_rgb), labels,
+                    (m2_lwir, m2_rgb), labels2
+                )
 
-        else:
+            # Now lwir first, then rgb
+            imgs_np = [m_lwir, m_rgb]
+        else: # no augmentation or mosaic
             # Load image
             # hw0s: original shapes, hw1s: resized shapes
-            imgs, hw0s, hw1s = self.load_image(index)
+            imgs_np, hw0s, hw1s = self.load_image(index)
 
-            for ii, (img, (h0, w0), (h, w)) in enumerate(zip(imgs, hw0s, hw1s)):
+            for ii, (img, (h0, w0), (h, w)) in enumerate(zip(imgs_np, hw0s, hw1s)):
                 # Letterbox
                 shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
                 img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
                 shapes = (h0, w0), (ratio, pad)  # for COCO mAP rescaling
+                imgs_np[ii] = img
 
-                labels = self.labels[index].copy()
-                if labels.size:  # normalized xywh to pixel xyxy format
-                    labels[:, 1:3] += labels[:, 3:5] / 2.0      # (x_lefttop, y_lefttop) -> (x_center, y_center)
-                    labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+            labels = self.labels[index].copy()
+            if labels.size:  # normalized xywh to pixel xyxy format
+                labels[:, 1:3] += labels[:, 3:5] / 2.0      # (x_lefttop, y_lefttop) -> (x_center, y_center)
+                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
 
-                if self.augment:
-                    raise NotImplementedError('Please make data augmentation work!')
+        nl = len(labels)  # number of labels
+        if nl:
+            labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=imgs_np[0].shape[1], h=imgs_np[0].shape[0], clip=True, eps=1e-3)
 
-                    img, labels = random_perspective(
-                        img,
-                        labels,
-                        degrees=hyp["degrees"],
-                        translate=hyp["translate"],
-                        scale=hyp["scale"],
-                        shear=hyp["shear"],
-                        perspective=hyp["perspective"],
-                    )
+        if self.augment:
+            # TODO: make augmentation work
+            imgs_np, labels = self.albumentations(imgs_np, labels, p=1.0)
 
-                nl = len(labels)  # number of labels
+            augment_hsv(imgs_np[1], hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
+
+            # Vertical flip
+            if random.random() < hyp["flipud"]:
+                imgs_np = [np.flipud(im) for im in imgs_np]
                 if nl:
-                    labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1e-3)
-
-                if self.augment:
-                    # Albumentations
-                    img, labels = self.albumentations(img, labels)
-                    nl = len(labels)  # update after albumentations
-
-                    # HSV color-space
-                    augment_hsv(img, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
-
-                    # Flip up-down
-                    if random.random() < hyp["flipud"]:
-                        img = np.flipud(img)
-                        if nl:
-                            labels[:, 2] = 1 - labels[:, 2]
-
-                    # Flip left-right
-                    if random.random() < hyp["fliplr"]:
-                        img = np.fliplr(img)
-                        if nl:
-                            labels[:, 1] = 1 - labels[:, 1]
-
-                    # Cutouts
-                    # labels = cutout(img, labels, p=0.5)
-                    # nl = len(labels)  # update after cutout
-
-                labels_out = torch.zeros((nl, 7))
+                    labels[:, 2] = 1.0 - labels[:, 2]
+            # horizontal flip
+            if random.random() < hyp["fliplr"]:
+                imgs_np = [np.fliplr(im) for im in imgs_np]
                 if nl:
-                    labels_out[:, 1:] = torch.from_numpy(labels)
+                    labels[:, 1] = 1.0 - labels[:, 1]
 
-                # Convert
-                img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-                img = np.ascontiguousarray(img)
+            # TODO: Cutouts
+            # labels = cutout(img, labels, p=0.5)
+            # nl = len(labels)  # update after cutout
 
-                imgs[ii] = torch.from_numpy(img)
+        imgs = []
+        for im in imgs_np:
+            t = im[:, :, ::-1].transpose(2, 0, 1)
+            imgs.append(torch.from_numpy(np.ascontiguousarray(t)))
+
+        nl = len(labels)
+        labels_out = torch.zeros((nl, 7))
+        if nl:
+            labels_out[:, 1:] = torch.from_numpy(labels)
 
         # Drop occlusion level
         labels_out = labels_out[:, :-1]
@@ -1315,6 +1321,81 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
 
         return self.ims[i], self.im_hw0[i], self.im_hw[i]  # im, hw_original, hw_resized
 
+    def load_mosaic(self, index):
+        """
+        Create a 2×2 mosaic for an LWIR–RGB image pair and return normalized xywh labels.
+
+        Returns:
+            (img4_lwir, img4_rgb): two H×W×3 mosaics (W = 2 * img_size), LWIR first
+            labels4 (np.ndarray[N,5]): (cls, x_center, y_center, w, h) normalized [0,1]
+        """
+        s = self.img_size
+        # 1. Sample mosaic center once
+        yc = int(random.uniform(-self.mosaic_border[0], 2 * s + self.mosaic_border[0]))
+        xc = int(random.uniform(-self.mosaic_border[1], 2 * s + self.mosaic_border[1]))
+
+        # 2. Choose this index + 3 random ones, shuffle
+        indices = [index] + random.choices(self.indices, k=3)
+        random.shuffle(indices)
+
+        # 3. Prepare blank canvases
+        img4_lwir = np.full((2 * s, 2 * s, 3), 114, dtype=np.uint8)
+        img4_rgb  = np.full((2 * s, 2 * s, 3), 114, dtype=np.uint8)
+        labels4, segments4 = [], []
+
+        # 4. Place each tile
+        for i, idx in enumerate(indices):
+            imgs, _, _ = self.load_image(idx)   # [RGB, LWIR], orig & resized dims ignored here
+            img_lwir, img_rgb = imgs[0], imgs[1]
+            h, w = img_rgb.shape[:2]
+
+            # compute paste coordinates in the 2s×2s canvas
+            if i == 0:  # top-left
+                x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h
+            elif i == 1:  # top-right
+                x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, 2*s), yc
+                x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
+            elif i == 2:  # bottom-left
+                x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(2*s, yc + h)
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
+            else:  # bottom-right
+                x1a, y1a, x2a, y2a = xc, yc, min(xc + w, 2*s), min(2*s, yc + h)
+                x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(h, y2a - y1a)
+
+            # paste RGB and LWIR patches
+            img4_lwir[y1a:y2a, x1a:x2a] = img_lwir[y1b:y2b, x1b:x2b]
+            img4_rgb [y1a:y2a, x1a:x2a] = img_rgb [y1b:y2b, x1b:x2b]
+            padw, padh = x1a - x1b, y1a - y1b
+
+            # adjust this tile’s labels from normalized→pixel xyxy
+            labels, segments = self.labels[idx].copy(), self.segments[idx].copy()
+
+            if labels.size:
+                labels[:, 1:3] += labels[:, 3:5] / 2.0      # (x_lefttop, y_lefttop) -> (x_center, y_center)
+                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padw, padh)
+                segments = [xyn2xy(s, w, h, padw, padh) for s in segments]
+
+            labels4.append(labels)
+            segments4.extend(segments)
+
+        # 5. Concatenate all tiles’ labels and clip within [0,2s]
+        labels4 = np.concatenate(labels4, axis=0)
+        for arr in (labels4[:, 1:], *segments4):
+            np.clip(arr, 0, 2 * s, out=arr)
+
+        # 6. Apply copy-paste and perspective to the pair
+        img4_lwir, img4_rgb, labels4, segments4 = copy_paste_pair(
+            img4_lwir, img4_rgb, labels4, segments4, p=self.hyp["copy_paste"]
+        )
+        img4_lwir, img4_rgb, labels4 = random_perspective_pair(
+            img4_lwir, img4_rgb, labels4, segments4,
+            degrees=self.hyp["degrees"], translate=self.hyp["translate"],
+            scale=self.hyp["scale"], shear=self.hyp["shear"],
+            perspective=self.hyp["perspective"], border=self.mosaic_border
+        )
+
+        return (img4_lwir, img4_rgb), labels4
 
     @staticmethod
     def collate_fn(batch):
@@ -1467,13 +1548,19 @@ def verify_rgbt_image_label(modalities, args):
     try:
         for modality in modalities:
             # verify images
+            # if modality == "visible" and Path(im_file.format("sinsr")).exists():
+            #     path = im_file.format("sinsr")
+            # else:
+            #     path = im_file.format(modality)
+
+            # im = Image.open(path)
             im = Image.open(im_file.format(modality))
             im.verify()  # PIL verify
             shape = exif_size(im)  # image size
             assert (shape[0] > 9) & (shape[1] > 9), f"image size {shape} <10 pixels"
             assert im.format.lower() in IMG_FORMATS, f"invalid image format {im.format}"
             if im.format.lower() in ("jpg", "jpeg"):
-                with open(im_file, "rb") as f:
+                with open(im_file.format(modality), "rb") as f:
                     f.seek(-2, 2)
                     if f.read() != b"\xff\xd9":  # corrupt JPEG
                         ImageOps.exif_transpose(Image.open(im_file)).save(im_file, "JPEG", subsampling=0, quality=100)
@@ -1507,7 +1594,7 @@ def verify_rgbt_image_label(modalities, args):
 
     except Exception as e:
         nc = 1
-        msg = f"{prefix}WARNING ⚠️ {im_file} : ignoring corrupt image/label: {e}"
+        msg = f"{prefix}WARNING ⚠️ {im_file} : ignoring corrupt image/label: {e} [RGBT]"
         return [None, None, None, None, nm, nf, ne, nc, msg]
 
 class HUBDatasetStats:
