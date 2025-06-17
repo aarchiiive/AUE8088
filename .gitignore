@@ -23,13 +23,16 @@ utils/eval/KAIST_annotation.json
 *.data
 *.json
 *.cfg
+*.xml
 !setup.cfg
 !cfg/yolov3*.cfg
 
 storage.googleapis.com
+kaist-rgbt/*
 runs/*
 data/*
 data/images/*
+datasets/*
 !data/*.yaml
 !data/hyps
 !data/scripts
