@@ -302,8 +302,8 @@ def run(
         # Plot images
         if plots and batch_i < 3:
             desc = f"val_batch{batch_i}" if epoch is None else f"val_epoch{epoch}_batch{batch_i}"
-            plot_images(ims, targets, paths, save_dir / f"{desc}_labels.jpg", names)  # labels
-            plot_images(ims, output_to_target(preds), paths, save_dir / f"{desc}_pred.jpg", names)  # pred
+            plot_images(ims, targets, paths, save_dir / "results" / f"{desc}_labels.jpg", names)  # labels
+            plot_images(ims, output_to_target(preds), paths, save_dir / "results" / f"{desc}_pred.jpg", names)  # pred
 
         callbacks.run("on_val_batch_end", batch_i, ims, targets, paths, shapes, preds)
 
@@ -348,22 +348,22 @@ def run(
         else:
             w = f'epoch{epoch}'
 
-        pred_json = str(save_dir / f"{w}_predictions.json")  # predictions
+        pred_json = str(save_dir / 'preds' / f"{save_dir.name}_{w}.json")  # predictions
         LOGGER.info(f"\nSaving {pred_json}...")
 
         with open(pred_json, "w") as f:
-            json.dump(jdict, f, indent=2)
+            json.dump(jdict, f, indent=4)
 
         LOGGER.info(f"\nEvaluating mAP...")
 
         # Run evaluation: KAIST Multispectral Pedestrian Dataset
-        try:
-            # HACK: need to generate KAIST_annotation.json for your own validation set
-            if not os.path.exists('utils/eval/KAIST_val-A_annotation.json'):
-                raise FileNotFoundError('Please generate KAIST_annotation.json for your own validation set. (See utils/eval/generate_kaist_ann_json.py)')
-            os.system(f"python3 utils/eval/kaisteval.py --annFile utils/eval/KAIST_val-A_annotation.json --rstFile {pred_json}")
-        except Exception as e:
-            LOGGER.info(f"kaisteval unable to run: {e}")
+        # try:
+        #     # HACK: need to generate KAIST_annotation.json for your own validation set
+        #     if not os.path.exists('utils/eval/KAIST_val-A_annotation.json'):
+        #         raise FileNotFoundError('Please generate KAIST_annotation.json for your own validation set. (See utils/eval/generate_kaist_ann_json.py)')
+        #     os.system(f"python3 utils/eval/kaisteval.py --annFile utils/eval/KAIST_val-A_annotation.json --rstFile {pred_json}")
+        # except Exception as e:
+        #     LOGGER.info(f"kaisteval unable to run: {e}")
 
     # Return results
     model.float()  # for training
