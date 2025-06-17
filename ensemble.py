@@ -11,6 +11,27 @@ import torch
 from torchvision.ops import nms
 from ensemble_boxes import weighted_boxes_fusion, soft_nms
 
+
+W, H = 640, 512
+
+
+def _clip01(vals):
+    return [min(max(v, 0.0), 1.0) for v in vals]
+
+
+def xywhc_to_xyxy(box):
+    """center‑xywh → corner‑xyxy"""
+    cx, cy, w, h = box
+    return [cx - w/2, cy - h/2, cx + w/2, cy + h/2]
+
+
+def xyxy_to_xywhc(x1, y1, x2, y2):
+    """corner‑xyxy → center‑xywh"""
+    cx = (x1 + x2) / 2
+    cy = (y1 + y2) / 2
+    return [cx, cy, x2 - x1, y2 - y1]
+
+
 def load_predictions(json_paths, path_format=None):
     """
     Load multiple JSON prediction files.
@@ -64,29 +85,6 @@ def load_predictions(json_paths, path_format=None):
 
     return models, image_id_to_name
 
-def _clip(vals):
-    return [min(max(v, 0.0), 1.0) for v in vals]
-
-# ——— Helpers ——————————————————————————————————
-
-
-W, H = 640, 512  # 이미지 크기 (w, h)
-
-def _clip01(vals):
-    return [min(max(v, 0.0), 1.0) for v in vals]
-
-def xywhc_to_xyxy(box):
-    """center‑xywh → corner‑xyxy"""
-    cx, cy, w, h = box
-    return [cx - w/2, cy - h/2, cx + w/2, cy + h/2]
-
-def xyxy_to_xywhc(x1, y1, x2, y2):
-    """corner‑xyxy → center‑xywh"""
-    cx = (x1 + x2) / 2
-    cy = (y1 + y2) / 2
-    return [cx, cy, x2 - x1, y2 - y1]
-
-# ——— ensemble methods ——————————————————————————————————
 
 def ensemble_wbf(models, image_id_to_name, iou_thr=0.5, skip_box_thr=0.0, weights=None):
     out = []
@@ -126,51 +124,6 @@ def ensemble_wbf(models, image_id_to_name, iou_thr=0.5, skip_box_thr=0.0, weight
     return out
 
 
-def ensemble_softnms(models, image_id_to_name,
-                     iou_thr=0.5, sigma=0.5, score_thr=0.001, method=2):
-    out = []
-    for img_id in sorted(image_id_to_name):
-        all_boxes, all_scores, all_labels = [], [], []
-
-        # 1-2) center→corner→정규화→클립
-        for m in models:
-            for d in m.get(img_id, []):
-                x1, y1, x2, y2 = xywhc_to_xyxy(d["bbox"])
-                all_boxes.append(_clip01([x1/W, y1/H, x2/W, y2/H]))
-                all_scores.append(d["score"])
-                all_labels.append(d["category_id"])
-
-        if not all_boxes:
-            continue
-
-        boxes_list  = [np.array(all_boxes)]
-        scores_list = [np.array(all_scores)]
-        labels_list = [np.array(all_labels)]
-
-        # 3) Soft‑NMS
-        try:
-            fb, fs, fl = soft_nms(
-                boxes_list, scores_list, labels_list,
-                iou_thr=iou_thr, sigma=sigma,
-                thresh=score_thr, method=method
-            )
-        except ValueError:
-            continue
-        if len(fb) == 0:
-            continue
-
-        # 4-5) 역정규화→corner→center
-        for (nx1, ny1, nx2, ny2), s, l in zip(fb, fs, fl):
-            x1, y1, x2, y2 = nx1*W, ny1*H, nx2*W, ny2*H
-            out.append({
-                "image_name":  image_id_to_name[img_id],
-                "image_id":    img_id,
-                "category_id": int(l),
-                "bbox":        xyxy_to_xywhc(x1, y1, x2, y2),
-                "score":       float(s)
-            })
-    return out
-
 def ensemble_nms(models, image_id_to_name, iou_thr=0.5):
     out = []
     for img_id in sorted(image_id_to_name):
@@ -197,78 +150,10 @@ def ensemble_nms(models, image_id_to_name, iou_thr=0.5):
             })
     return out
 
-def ensemble_voting(models, image_id_to_name, iou_thr=0.5):
-    def iou(a, b):
-        xx1 = max(a[0], b[0]); yy1 = max(a[1], b[1])
-        xx2 = min(a[2], b[2]); yy2 = min(a[3], b[3])
-        w = max(0, xx2-xx1); h = max(0, yy2-yy1)
-        inter = w*h
-        area = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
-        return inter/(area+1e-16)
-
-    out = []
-    for img_id in sorted(image_id_to_name):
-        boxes, scores, labels = [], [], []
-        for m in models:
-            for d in m.get(img_id, []):
-                boxes.append(xywhc_to_xyxy(d["bbox"]))
-                scores.append(d["score"])
-                labels.append(d["category_id"])
-        N = len(boxes)
-        used = [False]*N
-        for i in range(N):
-            if used[i]: continue
-            cluster = [i]
-            for j in range(i+1, N):
-                if not used[j] and iou(boxes[i], boxes[j]) > iou_thr:
-                    cluster.append(j)
-            xs = np.array([boxes[k][0] for k in cluster])
-            ys = np.array([boxes[k][1] for k in cluster])
-            xe = np.array([boxes[k][2] for k in cluster])
-            ye = np.array([boxes[k][3] for k in cluster])
-            sc = np.array([scores[k] for k in cluster])
-            lbl= np.array([labels[k] for k in cluster])
-            w = np.average(xe - xs, weights=sc)
-            h = np.average(ye - ys, weights=sc)
-            x = np.average(xs, weights=sc)
-            y = np.average(ys, weights=sc)
-            out.append({
-                "image_name":  image_id_to_name[img_id],
-                "image_id":     img_id,
-                "category_id": int(lbl[0]),
-                "bbox":        [ (x+ (x+w))/2, (y+ (y+h))/2, w, h ],
-                "score":       float(sc.mean())
-            })
-            for k in cluster:
-                used[k] = True
-    return out
-
-def ensemble_maxconf(models, image_id_to_name):
-    out = []
-    for img_id in sorted(image_id_to_name):
-        best = None
-        for m in models:
-            for d in m.get(img_id, []):
-                if best is None or d["score"] > best["score"]:
-                    best = d
-        if best:
-            out.append({
-                "image_name":  best["image_name"],
-                "image_id":     best["image_id"],
-                "category_id": best["category_id"],
-                "bbox":        best["bbox"],  # 이미 center-xywh
-                "score":       best["score"]
-            })
-    return out
-
-# ——— wiring & I/O ————————————————————————————————————————
 
 METHODS = {
     "wbf":    ensemble_wbf,
-    # "softnms":ensemble_softnms,
     "nms":    ensemble_nms,
-    "voting": ensemble_voting,
-    # "maxconf":ensemble_maxconf,
 }
 
 if __name__ == "__main__":
