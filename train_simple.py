@@ -8,12 +8,15 @@ Usage - Single-GPU training:
 
 Usage - Multi-GPU DDP training: Not Supported - Please use "train.py"
 """
+from typing import Sequence
 
 import argparse
 import math
+import pytz
 import numpy as np
 import os
 import random
+import shutil
 import sys
 import time
 import torch
@@ -75,6 +78,52 @@ from utils.torch_utils import (
 # LOGGERS = ("csv", "tb", "wandb", "clearml", "comet")  # *.csv, TensorBoard, Weights & Biases, ClearML
 LOGGERS = ("wandb",)  # *.csv, TensorBoard, Weights & Biases, ClearML
 
+def generate_timestamp():
+    kst = pytz.timezone('Asia/Seoul')
+    timestamp = datetime.now(kst).strftime('%Y%m%d_%H%M%S')
+
+    return timestamp
+
+def collect_code_files(
+    src_root: Path,
+    dest_root: Path,
+    include_dirs: Sequence[str] = (".", "data", "models", "utils"),
+    valid_suffixes: Sequence[str] = (".py", ".ipynb", ".sh", ".json", ".yaml", ".yml")
+):
+    """
+    Copy only specific file types from specified subdirectories of src_root to dest_root,
+    preserving directory structure. If "." is included, only files in the top-level directory
+    are considered (no subdirectories).
+
+    Args:
+        src_root (Path): Source root directory.
+        dest_root (Path): Destination root directory.
+        include_dirs (Sequence[str]): Subdirectories to include from src_root.
+        valid_suffixes (Sequence[str]): File suffixes to include (e.g., .py, .sh, .yaml).
+    """
+    src_root = src_root.resolve()
+    dest_root = dest_root.resolve()
+    print(f"Collecting code files from {src_root} to {dest_root}")
+
+    for dirname in include_dirs:
+        src_dir = src_root / dirname
+        print(f"Processing directory: {src_dir}")
+        if not src_dir.exists() or not src_dir.is_dir():
+            continue
+
+        # Handle "." separately to only get top-level files
+        if dirname == ".":
+            paths = [p for p in src_dir.iterdir() if p.is_file()]
+        else:
+            paths = [p for p in src_dir.rglob("*") if p.is_file()]
+
+        for path in paths:
+            if path.suffix in valid_suffixes:
+                rel_path = path.relative_to(src_root)
+                dest_path = dest_root / rel_path
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, dest_path)
+
 def train(hyp, opt, device, callbacks):
     """
     Trains YOLOv5 model with given hyperparameters, options, and device, managing datasets, model architecture, loss
@@ -97,9 +146,27 @@ def train(hyp, opt, device, callbacks):
     callbacks.run("on_pretrain_routine_start")
 
     # Directories
+    timestamp = generate_timestamp()
+    save_dir = save_dir.parent / f"{timestamp}_{save_dir.name}"  # save to project/name_timestamp
     w = save_dir / "weights"  # weights dir
     w.mkdir(parents=True, exist_ok=True)  # make dir
     last, best = w / "last.pt", w / "best.pt"
+
+    # work_dir = Path(work_dir) / project_name
+    # cfg.model.save_dir = cfg.train.work_dir
+    # work_dir = Path(cfg.train.work_dir)
+    weights_dir = save_dir / 'weights'
+    code_dir = save_dir / 'codes'
+    json_dir = save_dir / 'preds'
+    results_dir = save_dir / 'results'
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    code_dir.mkdir(parents=True, exist_ok=True)
+    json_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    # shutil.copy(args.config, code_dir / Path(args.config).name)
+    collect_code_files(Path('.'), code_dir)
+    print(f'Copied code files to {code_dir}')
 
     # Hyperparameters
     if isinstance(hyp, str):
@@ -107,6 +174,9 @@ def train(hyp, opt, device, callbacks):
             hyp = yaml.safe_load(f)  # load hyps dict
     LOGGER.info(colorstr("hyperparameters: ") + ", ".join(f"{k}={v}" for k, v in hyp.items()))
     opt.hyp = hyp.copy()  # for saving hyps to checkpoints
+
+    hyp["use_depth"] = opt.use_depth  # add use_depth to hyp
+    hyp["mixup"] = opt.mixup  # add mixup to hyp
 
     # Save run settings
     yaml_save(save_dir / "hyp.yaml", hyp)
@@ -185,7 +255,7 @@ def train(hyp, opt, device, callbacks):
         gs,
         single_cls,
         hyp=hyp,
-        augment=False,      # TODO: make it work
+        augment=opt.augment,      # TODO: make it work
         cache=None if opt.cache == "val" else opt.cache,
         rect=opt.rect,
         rank=-1,
@@ -394,7 +464,7 @@ def train(hyp, opt, device, callbacks):
                     single_cls=single_cls,
                     dataloader=val_loader,
                     save_dir=save_dir,
-                    save_json=True,
+                    save_json=False,
                     verbose=True,
                     plots=False,
                     callbacks=callbacks,
@@ -420,6 +490,7 @@ def parse_opt(known=False):
     parser.add_argument("--batch-size", type=int, default=16, help="total batch size for all GPUs, -1 for autobatch")
     parser.add_argument("--imgsz", "--img", "--img-size", type=int, default=640, help="train, val image size (pixels)")
     parser.add_argument("--rect", action="store_true", help="rectangular training")
+    parser.add_argument("--augment", action="store_true", help="augmented training")
     parser.add_argument("--resume", nargs="?", const=True, default=False, help="resume most recent training")
     parser.add_argument("--nosave", action="store_true", help="only save final checkpoint")
     parser.add_argument("--noval", action="store_true", help="only validate final epoch")
@@ -451,6 +522,8 @@ def parse_opt(known=False):
     parser.add_argument("--seed", type=int, default=0, help="Global training seed")
     parser.add_argument("--local_rank", type=int, default=-1, help="Automatic DDP Multi-GPU argument, do not modify")
     parser.add_argument("--rgbt", action="store_true", help="Feed RGB-T multispectral image pair.")
+    parser.add_argument("--use_depth", action="store_true", help="Use depth channel in RGB-T multispectral image pair.")
+    parser.add_argument("--mixup", type=float, default=0.0, help="MixUp augmentation probability (default: 0.0)")
 
     # Logger arguments
     parser.add_argument("--entity", default=None, help="Entity")
@@ -473,6 +546,7 @@ def main(opt, callbacks=Callbacks()):
         str(opt.weights),
         str(opt.project),
     )  # checks
+
     assert len(opt.cfg) or len(opt.weights), "either --cfg or --weights must be specified"
     if opt.name == "cfg":
         opt.name = Path(opt.cfg).stem  # use model.yaml as name
