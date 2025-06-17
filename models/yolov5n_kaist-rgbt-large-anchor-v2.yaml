@@ -1,0 +1,51 @@
+# YOLOv5 🚀 by Ultralytics, AGPL-3.0 license
+
+# Parameters
+nc: 1 # number of classes
+depth_multiple: 1.0 # model depth multiple
+width_multiple: 1.0 # layer channel multiple
+anchors:
+  - [  8,  32,   12,  48,   16,  64]    # P3/8, from stats: 0.0360×0.0933→23×59, 0.0717×0.0906→45×57, 0.0492×0.1340→31×85
+  - [ 16,  64,   24,  96,   32, 128]   # P4/16, from stats: 0.0643×0.1806→41×115, 0.1817×0.1001→116×64, 0.0792×0.2351→50×150
+  - [ 32, 128,   48, 192,   64, 256]   # P5/32, from stats: 0.1054×0.3189→67×204, 0.3131×0.1098→200×70, 0.1369×0.4398→87×281
+
+# YOLOv5 v6.0 backbone
+backbone:
+  # [from, number, module, args]
+  [
+    [-1, 1, MultiStreamConv, [64, 6, 2, 2]], # 0-P1/2
+    [-1, 1, MultiStreamConv, [128, 3, 2]], # 1-P2/4
+    [-1, 3, MultiStreamC3, [128]],
+    [-1, 1, Fusion, ['concat', 2]],
+    [-1, 1, Conv, [256, 1, 1]],
+    [-1, 1, Conv, [256, 3, 2]], # 5-P3/8
+    [-1, 6, C3, [256]],
+    [-1, 1, Conv, [512, 3, 2]], # 7-P4/16
+    [-1, 9, C3, [512]],
+    [-1, 1, Conv, [1024, 3, 2]], # 9-P5/32
+    [-1, 3, C3, [1024]],
+    [-1, 1, SPPF, [1024, 5]], # 11
+  ]
+
+# YOLOv5 v6.0 head
+head: [
+    [-1, 1, Conv, [512, 1, 1]],
+    [-1, 1, nn.Upsample, [None, 2, "nearest"]],
+    [[-1, 7], 1, Concat, [1]], # cat backbone P4
+    [-1, 3, C3, [512, False]], # 15
+
+    [-1, 1, Conv, [256, 1, 1]],
+    [-1, 1, nn.Upsample, [None, 2, "nearest"]],
+    [[-1, 5], 1, Concat, [1]], # cat backbone P3
+    [-1, 3, C3, [256, False]], # 19 (P3/8-small)
+
+    [-1, 1, Conv, [256, 3, 2]],
+    [[-1, 15], 1, Concat, [1]], # cat head P4
+    [-1, 3, C3, [512, False]], # 22 (P4/16-medium)
+
+    [-1, 1, Conv, [512, 3, 2]],
+    [[-1, 11], 1, Concat, [1]], # cat head P5
+    [-1, 3, C3, [1024, False]], # 25 (P5/32-large)
+
+    [[19, 22, 25], 1, Detect, [nc, anchors]], # Detect(P3, P4, P5)
+  ]
