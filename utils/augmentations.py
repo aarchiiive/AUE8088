@@ -10,6 +10,8 @@ import torch
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 
+import albumentations as A
+
 from utils.general import LOGGER, check_version, colorstr, resample_segments, segment2box, xywhn2xyxy
 from utils.metrics import bbox_ioa
 
@@ -52,6 +54,83 @@ class Albumentations:
             new = self.transform(image=im, bboxes=labels[:, 1:], class_labels=labels[:, 0])  # transformed
             im, labels = new["image"], np.array([[c, *b] for c, b in zip(new["class_labels"], new["bboxes"])])
         return im, labels
+
+class AlbumentationsPair:
+    """
+    RGB/LWIR paired augmentations:
+      - RGB: blur, gray, CLAHE, brightness/contrast, gamma, compression
+      - LWIR: light blur + Gaussian noise to simulate sensor noise
+    Bounding boxes (normalized xywh) are unchanged.
+    """
+    def __init__(self, size=640):
+        # enforce Albumentations version
+        check_version(A.__version__, "1.0.3", hard=True)
+        prefix = colorstr("albumentations_pair: ")
+
+        # RGB-only transforms (no geometry changes)
+        rgb_transforms = [
+            A.Blur(p=0.01),
+            A.MedianBlur(p=0.01),
+            A.ToGray(p=0.01),
+            A.CLAHE(p=0.01),
+            A.RandomBrightnessContrast(p=0.2),
+            A.RandomGamma(p=0.2),
+            A.ImageCompression(quality_lower=75, p=0.01),
+        ]
+        # rgb_transforms = [
+        #     A.Blur(blur_limit=3, p=0.02),               # Apply a 3×3 blur with 2% probability
+        #     A.MedianBlur(blur_limit=3, p=0.02),         # Apply a 3×3 median blur with 2% probability
+        #     A.ToGray(p=0.02),                           # Convert to grayscale with 2% probability
+        #     A.CLAHE(clip_limit=2.0, p=0.02),            # Apply CLAHE with 2% probability
+        #     A.RandomBrightnessContrast(p=0.3),          # Randomly adjust brightness/contrast with 30% probability
+        #     A.RandomGamma(p=0.3),                       # Randomly adjust gamma with 30% probability
+        #     A.HueSaturationValue(p=0.2),                # Shift hue/saturation/value with 20% probability
+        #     A.ImageCompression(quality_lower=50, p=0.05) # Simulate JPEG compression artifacts with 5% probability
+        # ]
+        self.rgb_transform = A.Compose(rgb_transforms)
+
+        # LWIR-only transforms: light blur + Gaussian sensor noise
+        lwir_transforms = [
+            A.Blur(p=0.01),
+            A.MedianBlur(p=0.01),
+            A.GaussNoise(var_limit=(5.0, 20.0), p=0.05),
+        ]
+        # LWIR-only transforms: stronger blur and sensor noise
+        # lwir_transforms = [
+        #     A.Blur(blur_limit=7, p=0.05),           # Apply a 7×7 blur with 5% probability
+        #     A.MedianBlur(blur_limit=5, p=0.05),     # Apply a 5×5 median blur with 5% probability
+        #     A.GaussNoise(var_limit=(10.0, 50.0), p=0.1),  # Add Gaussian noise (variance 10–50) with 10% probability
+        # ]
+        self.lwir_transform = A.Compose(lwir_transforms)
+
+        LOGGER.info(f"{prefix}RGB-only: " +
+                    ", ".join(str(t) for t in rgb_transforms if t.p))
+        LOGGER.info(f"{prefix}LWIR-only: " +
+                    ", ".join(str(t) for t in lwir_transforms if t.p))
+
+    def __call__(self, pair, labels, p=1.0):
+        """
+        Args:
+            pair (tuple): (lwir_bgr, rgb_bgr), each H×W×3 uint8
+            labels (np.ndarray[N,5]): (cls, x_center, y_center, w, h) normalized [0,1]
+            p (float): probability to apply the augmentation set
+
+        Returns:
+            (lwir_aug, rgb_aug), labels (unchanged)
+        """
+        # unpack in LWIR–RGB order
+        lwir, rgb = pair
+
+        if random.random() < p:
+            # apply RGB-specific transforms to the second element
+            out_rgb = self.rgb_transform(image=rgb)
+            rgb = out_rgb["image"]
+            # apply LWIR-specific transforms to the first element
+            out_lwir = self.lwir_transform(image=lwir)
+            lwir = out_lwir["image"]
+
+        # return in the same LWIR–RGB order
+        return (lwir, rgb), labels
 
 
 def normalize(x, mean=IMAGENET_MEAN, std=IMAGENET_STD, inplace=False):
@@ -240,6 +319,104 @@ def random_perspective(
 
     return im, targets
 
+def random_perspective_pair(
+    img_lwir,
+    img_rgb,
+    targets=(),
+    segments=(),
+    degrees=10,
+    translate=0.1,
+    scale=0.1,
+    shear=10,
+    perspective=0.0,
+    border=(0, 0),
+):
+    """
+    Apply the same random perspective/affine transform to an LWIR–RGB pair.
+
+    Args:
+        img_lwir (np.ndarray): H×W×3 LWIR image
+        img_rgb  (np.ndarray): H×W×3 RGB image
+        targets   (np.ndarray[N,5]): array of (cls, x1, y1, x2, y2) in pixel coords
+        segments  (list[np.ndarray]): list of N polygon segments for copy-paste
+        degrees, translate, scale, shear, perspective: augmentation hyperparameters
+        border    (tuple): extra border (y, x) to allow for translation
+
+    Returns:
+        warped_lwir (np.ndarray): transformed LWIR image
+        warped_rgb  (np.ndarray): transformed RGB image
+        new_targets (np.ndarray): filtered & warped targets, same format as input
+    """
+    # image dimensions with optional border
+    height = img_lwir.shape[0] + border[0] * 2
+    width  = img_lwir.shape[1] + border[1] * 2
+
+    # 1. Center translation to origin
+    C = np.eye(3)
+    C[0, 2] = -img_lwir.shape[1] / 2
+    C[1, 2] = -img_lwir.shape[0] / 2
+
+    # 2. Random perspective component
+    P = np.eye(3)
+    P[2, 0] = random.uniform(-perspective, perspective)
+    P[2, 1] = random.uniform(-perspective, perspective)
+
+    # 3. Rotation + scale
+    R = np.eye(3)
+    angle = random.uniform(-degrees, degrees)
+    s = random.uniform(1 - scale, 1 + scale)
+    R[:2] = cv2.getRotationMatrix2D((0, 0), angle, s)
+
+    # 4. Shear
+    S = np.eye(3)
+    S[0, 1] = math.tan(random.uniform(-shear, shear) * math.pi / 180)
+    S[1, 0] = math.tan(random.uniform(-shear, shear) * math.pi / 180)
+
+    # 5. Final translation
+    T = np.eye(3)
+    T[0, 2] = random.uniform(0.5 - translate, 0.5 + translate) * width
+    T[1, 2] = random.uniform(0.5 - translate, 0.5 + translate) * height
+
+    # Combined transformation matrix
+    M = T @ S @ R @ P @ C
+
+    # Apply to both modalities
+    if perspective:
+        warped_lwir = cv2.warpPerspective(img_lwir, M, (width, height), borderValue=(114, 114, 114))
+        warped_rgb  = cv2.warpPerspective(img_rgb,  M, (width, height), borderValue=(114, 114, 114))
+    else:
+        warped_lwir = cv2.warpAffine(img_lwir, M[:2], (width, height), borderValue=(114, 114, 114))
+        warped_rgb  = cv2.warpAffine(img_rgb,  M[:2], (width, height), borderValue=(114, 114, 114))
+
+    # Transform bounding boxes
+    n = len(targets)
+    if n:
+        # 4 corners per box in homogeneous coords
+        pts = np.ones((n * 4, 3))
+        pts[:, :2] = targets[:, [1, 2, 3, 4, 1, 4, 3, 2]].reshape(n * 4, 2)
+        pts = pts @ M.T
+        if perspective:
+            pts[:, :2] /= pts[:, 2:3]
+        pts = pts[:, :2].reshape(n, 8)
+
+        # Reconstruct x1,y1,x2,y2
+        x = pts[:, [0, 2, 4, 6]]
+        y = pts[:, [1, 3, 5, 7]]
+        new_boxes = np.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
+
+        # Clip to valid image area
+        new_boxes[:, [0, 2]] = new_boxes[:, [0, 2]].clip(0, width)
+        new_boxes[:, [1, 3]] = new_boxes[:, [1, 3]].clip(0, height)
+
+        # Filter small or collapsed boxes
+        area0 = (targets[:, 3] - targets[:, 1]) * (targets[:, 4] - targets[:, 2])
+        area1 = (new_boxes[:, 2] - new_boxes[:, 0]) * (new_boxes[:, 3] - new_boxes[:, 1])
+        valid = area1 / (area0 + 1e-16) > 0.1
+
+        targets = targets[valid].copy()
+        targets[:, 1:5] = new_boxes[valid]
+
+    return warped_lwir, warped_rgb, targets
 
 def copy_paste(im, labels, segments, p=0.5):
     """
@@ -266,6 +443,54 @@ def copy_paste(im, labels, segments, p=0.5):
 
     return im, labels, segments
 
+def copy_paste_pair(img_lwir, img_rgb, labels, segments, p=0.5):
+    """
+    Apply YOLOv5-style copy-paste to an LWIR–RGB pair with exactly the same objects and locations.
+
+    Args:
+        img_lwir (np.ndarray): H×W×3 LWIR image
+        img_rgb  (np.ndarray): H×W×3 RGB image
+        labels   (np.ndarray): N×5 array of (cls, x1, y1, x2, y2)
+        segments (list[np.ndarray]): list of N segment polygons (M_i×2 arrays)
+        p        (float): fraction of segments to attempt to paste (0.0–1.0)
+
+    Returns:
+        img_lwir_out, img_rgb_out, labels_out, segments_out
+    """
+    n = len(segments)
+    if not (p and n):
+        return img_lwir, img_rgb, labels, segments
+
+    h, w = img_lwir.shape[:2]
+    mask_canvas = np.zeros((h, w), np.uint8)
+
+    to_paste = random.sample(range(n), k=round(p * n))
+    labels_out   = labels.copy()
+    segments_out = segments.copy()
+
+    for j in to_paste:
+        cls, x1, y1, x2, y2 = labels[j]
+        # horizontally flipped box
+        box = (w - x2, y1, w - x1, y2)
+        if (bbox_ioa(box, labels[:, 1:5]) < 0.30).all():
+            labels_out   = np.vstack([labels_out,   [cls, *box]])
+            seg = segments[j]
+            flipped_seg = np.hstack([w - seg[:, :1], seg[:, 1:2]])
+            segments_out.append(flipped_seg)
+            cv2.drawContours(mask_canvas, [flipped_seg.astype(np.int32)], -1, 1, cv2.FILLED)
+
+    # flip both images
+    flipped_lwir = cv2.flip(img_lwir, 1)
+    flipped_rgb  = cv2.flip(img_rgb,  1)
+    mask = mask_canvas.astype(bool)
+
+    # composite on mask
+    img_lwir_out = img_lwir.copy()
+    img_lwir_out[mask] = flipped_lwir[mask]
+    img_rgb_out  = img_rgb.copy()
+    img_rgb_out[mask]  = flipped_rgb[mask]
+
+    return img_lwir_out, img_rgb_out, labels_out, segments_out
 
 def cutout(im, labels, p=0.5):
     """
@@ -309,6 +534,34 @@ def mixup(im, labels, im2, labels2):
     labels = np.concatenate((labels, labels2), 0)
     return im, labels
 
+def mixup_pair(pair1, labels1, pair2, labels2):
+    """
+    MixUp for an LWIR–RGB pair.
+
+    Args:
+        pair1: tuple (img_lwir1, img_rgb1), each H×W×3 uint8
+        labels1: np.ndarray[N1×5] (cls, x_center, y_center, w, h)
+        pair2: tuple (img_lwir2, img_rgb2)
+        labels2: np.ndarray[N2×5]
+
+    Returns:
+        mixed_pair: (mixed_lwir, mixed_rgb)
+        mixed_labels: np.ndarray[(N1+N2)×5]
+    """
+    # same beta distribution for both modalities
+    r = np.random.beta(32.0, 32.0)
+
+    img_lwir1, img_rgb1 = pair1
+    img_lwir2, img_rgb2 = pair2
+
+    # blend both channels with the same ratio
+    mixed_lwir = (img_lwir1 * r + img_lwir2 * (1 - r)).astype(np.uint8)
+    mixed_rgb  = (img_rgb1  * r + img_rgb2  * (1 - r)).astype(np.uint8)
+
+    # just concatenate labels
+    mixed_labels = np.concatenate((labels1, labels2), axis=0)
+
+    return (mixed_lwir, mixed_rgb), mixed_labels
 
 def box_candidates(box1, box2, wh_thr=2, ar_thr=100, area_thr=0.1, eps=1e-16):
     """
