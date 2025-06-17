@@ -17,6 +17,7 @@ import sys
 import tempfile
 import traceback
 import warnings
+from pathlib import Path
 
 from coco import COCO
 from cocoeval import COCOeval, Params
@@ -578,8 +579,49 @@ def evaluate(test_annotation_file: str, user_submission_file: str, phase_codenam
     Dict
         Evaluated/Accumulated KAISTPedEval objects for All/Day/Night
     """
+    print()
+    print()
+    print()
+    print(f"rstFile: {Path(user_submission_file).name}")
+    # Load files
+    with open(test_annotation_file, 'r') as f:
+        gt_data = json.load(f)
+        # print(f"📂 Loaded {len(gt_data['annotations'])} ground truth images")
+
+    with open(user_submission_file, 'r') as f:
+        pred_data = json.load(f)
+        # print(f"📂 Loaded {len(pred_data)} predictions")
+
+    # Build mapping between image_id and image name
+    # print('\n🧩 Mapping image_name to image_id (based on GT)')
+    name_to_image_id = {Path(img['im_name']).stem: img['id'] for img in gt_data['images']}
+
+    # Remap predictions using image_name
+    unmatched = 0
+    updated_preds = []
+
+    for pred in pred_data:
+        image_name = pred['image_name']
+        new_image_id = name_to_image_id[image_name]
+        if new_image_id is None:
+            print(f"❌ image_name '{image_name}' not found in GT")
+            unmatched += 1
+        else:
+            pred['image_id'] = new_image_id
+            pred['category_id'] = 0  # if all predictions are pedestrian
+            updated_preds.append(pred)
+
+    # print(f"\n📊 Total predictions: {len(pred_data)}")
+    # print(f"🚫 Unmatched predictions: {unmatched}")
+
+    # Save the remapped predictions temporarily
+    temp_submission_file = 'temp.json'
+    with open(temp_submission_file, 'w') as f:
+        json.dump(updated_preds, f, indent=2)
+    # print(f"✅ Remapped prediction file saved to '{temp_submission_file}'")
+
     kaistGt = KAIST(test_annotation_file)
-    kaistDt = kaistGt.loadRes(user_submission_file)
+    kaistDt = kaistGt.loadRes(temp_submission_file)
 
     imgIds = sorted(kaistGt.getImgIds())
     method = os.path.basename(user_submission_file).split('_')[0]
@@ -635,7 +677,7 @@ def evaluate(test_annotation_file: str, user_submission_file: str, phase_codenam
 
     print('')
     # eval_result['night'].params.imgIds = imgIds[1455:]
-    eval_result['day'].params.imgIds = [ii for ii, img in kaistGt.imgs.items() if get_time_of_day(img['im_name']) == 'night']
+    eval_result['night'].params.imgIds = [ii for ii, img in kaistGt.imgs.items() if get_time_of_day(img['im_name']) == 'night']
     eval_result['night'].evaluate(0)
     eval_result['night'].accumulate()
     MR_night = eval_result['night'].summarize(0, subsetStr='Night')
@@ -656,7 +698,7 @@ def evaluate(test_annotation_file: str, user_submission_file: str, phase_codenam
     return eval_result
 
 
-def draw_all(eval_results, filename='figure.jpg'):
+def draw_all(eval_results, methods=None, filename='figure.jpg'):
     """Draw all results in a single figure as Miss rate versus false positive per-image (FPPI) curve
 
     Parameters
@@ -669,7 +711,7 @@ def draw_all(eval_results, filename='figure.jpg'):
     """
     fig, axes = plt.subplots(1, 3, figsize=(45, 10))
 
-    methods = [res['all'].method for res in eval_results]
+    # methods = [res['all'].method for res in eval_results]
     colors = [plt.get_cmap('Paired')(ii)[:3] for ii in range(len(eval_results))]
 
     try:
@@ -702,10 +744,21 @@ if __name__ == "__main__":
                         help='Please put the output path of the Miss rate versus false positive per-image (FPPI) curve')
     args = parser.parse_args()
 
+    evalFig = 'results.png'
+    annFile = 'utils/eval/KAIST_val-D_annotation-split3.json'
+    rstFiles = [
+        '/your/path/to/results1.json',
+        '/your/path/to/results2.json',
+    ]
+    methods = ['baseline', 'large+aug+enhanced']
+    assert len(rstFiles) == len(methods), "Number of result files must match number of methods"
+
     phase = "Multispectral"
-    results = [evaluate(args.annFile, rstFile, phase) for rstFile in args.rstFiles]
+    results = [evaluate(annFile, rstFile, phase) for rstFile in rstFiles]
 
     # Sort results by MR_all
-    if args.evalFig is not None:
-        results = sorted(results, key=lambda x: x['all'].summarize(0), reverse=True)
-        draw_all(results, filename=args.evalFig)
+    if evalFig is not None:
+        # results = sorted(results, key=lambda x: x['all'].summarize(0), reverse=True)
+        results = sorted(results, key=lambda x: x['all'].summarize(0)[0], reverse=True)
+        draw_all(results, methods, filename=evalFig)
+
